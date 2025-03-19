@@ -20,8 +20,7 @@
   <a href="https://pkg.go.dev/github.com/landaiqing/go-pixelnebula"><img src="https://img.shields.io/badge/go-reference-blue?style=flat-square&logo=go" alt="Go Reference"></a>
   <a href="https://goreportcard.com/"><img src="https://img.shields.io/badge/go%20report-A+-brightgreen?style=flat-square&logo=go" alt="Go Report Card"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square&logo=github" alt="License"></a>
-  <a href="https://github.com/landaiqing/go-pixelnebula/releases"><img src="https://img.shields.io/badge/version-1.0.0-blue?style=flat-square&logo=github" alt="Version"></a>
-  <a href="http://makeapullrequest.com"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square&logo=github" alt="PRs Welcome"></a>
+  <a href="https://github.com/landaiqing/go-pixelnebula/releases"><img src="https://img.shields.io/badge/version-0.1.0-blue?style=flat-square&logo=github" alt="Version"></a>
 </div>
 
 <p align="center" style="color: #ffffff;background: rgba(255, 255, 255, 0.1);padding: 15px; border-radius: 10px; ">
