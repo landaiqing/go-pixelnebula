@@ -311,3 +311,57 @@ func (c *PNCache) UpdateOptions(options CacheOptions) {
 		}
 	}
 }
+
+// GetAllItems 获取所有缓存项
+func (c *PNCache) GetAllItems() map[CacheKey]*CacheItem {
+	c.Mutex.RLock()
+	defer c.Mutex.RUnlock()
+
+	// 创建一个副本，避免直接暴露内部map
+	items := make(map[CacheKey]*CacheItem, len(c.Items))
+
+	// 从EvictionList获取所有缓存项
+	for e := c.EvictionList.Front(); e != nil; e = e.Next() {
+		item := e.Value.(*CacheItem)
+
+		// 查找对应的key
+		for k, v := range c.Items {
+			if v == e {
+				// 创建项的副本
+				itemCopy := *item
+				items[k] = &itemCopy
+				break
+			}
+		}
+	}
+
+	return items
+}
+
+// GetMonitor 获取缓存监控器
+func (c *PNCache) GetMonitor() *Monitor {
+	c.Mutex.RLock()
+	defer c.Mutex.RUnlock()
+
+	return c.Monitor
+}
+
+// DeleteItem 删除指定的缓存项
+func (c *PNCache) DeleteItem(key CacheKey) bool {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+
+	// 查找对应的缓存项
+	element, found := c.Items[key]
+	if !found {
+		return false
+	}
+
+	// 从链表中移除
+	c.EvictionList.Remove(element)
+
+	// 从映射中删除
+	delete(c.Items, key)
+
+	return true
+}

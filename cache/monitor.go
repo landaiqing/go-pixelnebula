@@ -99,6 +99,18 @@ func (m *Monitor) GetStats() CacheStats {
 	return m.stats
 }
 
+// GetSampleHistory 获取采样历史
+func (m *Monitor) GetSampleHistory() []CacheStats {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	// 创建一个副本
+	result := make([]CacheStats, len(m.sampleHistory))
+	copy(result, m.sampleHistory)
+
+	return result
+}
+
 // monitorRoutine 监控例程
 func (m *Monitor) monitorRoutine() {
 	sampleTicker := time.NewTicker(m.options.SampleInterval)
@@ -128,8 +140,37 @@ func (m *Monitor) collectSample() {
 	hits, misses, hitRate := m.cache.Stats()
 	size := m.cache.Size()
 
-	// 估算内存使用量（简化计算，实际应用中可能需要更精确的方法）
-	memoryUsage := int64(size * 1024) // 假设每个缓存项平均占用1KB
+	// 估算内存使用量
+	var memoryUsage int64
+
+	// 获取所有缓存项
+	items := m.cache.GetAllItems()
+
+	for _, item := range items {
+		itemSize := int64(0)
+
+		// 计算SVG字符串占用的内存
+		if !item.IsCompressed {
+			itemSize += int64(len(item.SVG) * 2) // Go中字符串以UTF-16编码存储，每个字符占2字节
+		}
+
+		// 计算压缩数据占用的内存
+		if item.IsCompressed {
+			itemSize += int64(len(item.Compressed))
+		}
+
+		// 添加对象结构体本身的大小估计
+		// CacheItem结构体的基本大小约为40字节（2个时间戳、1个布尔值、2个引用）
+		itemSize += 40
+
+		memoryUsage += itemSize
+	}
+
+	// 添加缓存管理结构的开销估计 (映射表、双向链表等)
+	// 每个map项约24字节开销，每个链表节点约16字节
+	mapOverhead := int64(size * 24)
+	listOverhead := int64(size * 16)
+	memoryUsage += mapOverhead + listOverhead
 
 	// 创建新的统计样本
 	newStat := CacheStats{

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/landaiqing/go-pixelnebula/animation"
 	"github.com/landaiqing/go-pixelnebula/cache"
@@ -184,12 +185,22 @@ func (pn *PixelNebula) calcKey(hash []string, opts *PNOptions) [2]int {
 // WithCache 设置缓存选项
 func (pn *PixelNebula) WithCache(options cache.CacheOptions) *PixelNebula {
 	pn.cache = cache.NewCache(options)
+	// 确保启动监控器
+	if pn.cache != nil && options.Monitoring.Enabled && pn.cache.GetMonitor() == nil {
+		pn.cache.Monitor = cache.NewMonitor(pn.cache, options.Monitoring)
+		pn.cache.Monitor.Start()
+	}
 	return pn
 }
 
 // WithDefaultCache 设置默认缓存选项
 func (pn *PixelNebula) WithDefaultCache() *PixelNebula {
 	pn.cache = cache.NewDefaultCache()
+	// 确保启动监控器
+	if pn.cache != nil && pn.cache.GetOptions().Monitoring.Enabled && pn.cache.GetMonitor() == nil {
+		pn.cache.Monitor = cache.NewMonitor(pn.cache, pn.cache.GetOptions().Monitoring)
+		pn.cache.Monitor.Start()
+	}
 	return pn
 }
 
@@ -738,4 +749,172 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 	}
 
 	return svg, nil
+}
+
+// GetCacheStats 获取缓存统计信息
+func (pn *PixelNebula) GetCacheStats() (size, hits, misses int, hitRate float64, enabled bool, maxSize int, expiration time.Duration, evictionType string) {
+	if pn.cache == nil {
+		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
+		return 0, 0, 0, 0, false, 0, 0, ""
+	}
+
+	hits, misses, hitRate = pn.cache.Stats()
+	options := pn.cache.GetOptions()
+
+	return pn.cache.Size(), hits, misses, hitRate, options.Enabled, options.Size, options.Expiration, options.EvictionType
+}
+
+// CacheItemInfo 缓存项信息结构体
+type CacheItemInfo struct {
+	Key          cache.CacheKey
+	SVG          string
+	Compressed   []byte
+	IsCompressed bool
+	CreatedAt    time.Time
+	LastUsed     time.Time
+}
+
+// GetCacheItems 获取所有缓存项
+func (pn *PixelNebula) GetCacheItems() []CacheItemInfo {
+	result := []CacheItemInfo{}
+
+	if pn.cache == nil {
+		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
+		return result
+	}
+
+	// 获取内部缓存项
+	items := pn.cache.GetAllItems()
+	if len(items) == 0 {
+		log.Println("pixelnebula: 缓存中没有数据，请先生成一些SVG")
+	}
+
+	for key, item := range items {
+		cacheItem := CacheItemInfo{
+			Key:          key,
+			SVG:          item.SVG,
+			Compressed:   item.Compressed,
+			IsCompressed: item.IsCompressed,
+			CreatedAt:    item.CreatedAt,
+			LastUsed:     item.LastUsed,
+		}
+
+		result = append(result, cacheItem)
+	}
+
+	return result
+}
+
+// MonitorSampleInfo 监控样本信息
+type MonitorSampleInfo struct {
+	Timestamp   time.Time
+	Size        int
+	Hits        int
+	Misses      int
+	HitRate     float64
+	MemoryUsage int64
+}
+
+// GetMonitorStats 获取监控统计信息
+func (pn *PixelNebula) GetMonitorStats() (enabled bool, sampleInterval, adjustInterval time.Duration,
+	targetHitRate float64, lastAdjusted time.Time, samples []MonitorSampleInfo) {
+
+	if pn.cache == nil {
+		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
+		return false, 0, 0, 0, time.Time{}, nil
+	}
+
+	options := pn.cache.GetOptions().Monitoring
+
+	// 确保监控器已启用并初始化
+	if !options.Enabled {
+		log.Println("pixelnebula: 监控未启用，请设置Monitoring.Enabled=true")
+		return options.Enabled, options.SampleInterval, options.AdjustInterval, options.TargetHitRate, time.Time{}, nil
+	}
+
+	if pn.cache.GetMonitor() == nil {
+		log.Println("pixelnebula: 监控器未初始化，正在初始化...")
+		pn.cache.Monitor = cache.NewMonitor(pn.cache, options)
+		pn.cache.Monitor.Start()
+	}
+
+	monitor := pn.cache.GetMonitor()
+	stats := monitor.GetStats()
+	sampleHistory := monitor.GetSampleHistory()
+
+	if len(sampleHistory) == 0 {
+		log.Println("pixelnebula: 监控样本为空，请等待采样完成")
+	}
+
+	// 转换样本历史
+	samplesInfo := make([]MonitorSampleInfo, 0, len(sampleHistory))
+	for _, sample := range sampleHistory {
+		sampleInfo := MonitorSampleInfo{
+			Timestamp:   sample.LastAdjusted,
+			Size:        sample.Size,
+			Hits:        sample.Hits,
+			Misses:      sample.Misses,
+			HitRate:     sample.HitRate,
+			MemoryUsage: sample.MemoryUsage,
+		}
+		samplesInfo = append(samplesInfo, sampleInfo)
+	}
+
+	return options.Enabled, options.SampleInterval, options.AdjustInterval,
+		options.TargetHitRate, stats.LastAdjusted, samplesInfo
+}
+
+// DeleteCacheItem 删除指定的缓存项
+func (pn *PixelNebula) DeleteCacheItem(key string) bool {
+	if pn.cache == nil {
+		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
+		return false
+	}
+
+	// 解析key字符串，格式为"id_sansEnv_theme_part"
+	parts := strings.Split(key, "_")
+	if len(parts) < 4 {
+		log.Printf("pixelnebula: 无效的key格式: %s，应为'id_sansEnv_theme_part'", key)
+		return false
+	}
+
+	id := parts[0]
+	sansEnv := parts[1] == "true"
+
+	theme, err := strconv.Atoi(parts[2])
+	if err != nil {
+		log.Printf("pixelnebula: 解析theme失败: %v", err)
+		return false
+	}
+
+	part, err := strconv.Atoi(parts[3])
+	if err != nil {
+		log.Printf("pixelnebula: 解析part失败: %v", err)
+		return false
+	}
+
+	// 构造CacheKey
+	cacheKey := cache.CacheKey{
+		Id:      id,
+		SansEnv: sansEnv,
+		Theme:   theme,
+		Part:    part,
+	}
+
+	result := pn.cache.DeleteItem(cacheKey)
+	if !result {
+		log.Printf("pixelnebula: 未找到缓存项: %s", key)
+	}
+	return result
+}
+
+// ClearCache 清空缓存
+func (pn *PixelNebula) ClearCache() {
+	if pn.cache == nil {
+		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
+		return
+	}
+
+	pn.cache.Clear()
+	log.Println("pixelnebula: 缓存已清空")
 }
