@@ -2,8 +2,26 @@ package cache
 
 import (
 	"container/list"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	// 字符串构建器对象池
+	stringBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return new(strings.Builder)
+		},
+	}
+
+	// 缓存项对象池
+	cacheItemPool = sync.Pool{
+		New: func() interface{} {
+			return new(CacheItem)
+		},
+	}
 )
 
 // CacheOptions 缓存配置选项
@@ -14,6 +32,8 @@ type CacheOptions struct {
 	EvictionType string          // 缓存淘汰策略，支持"lru"(最近最少使用)和"fifo"(先进先出)
 	Compression  CompressOptions // 压缩选项
 	Monitoring   MonitorOptions  // 监控选项
+	// 新增选项：是否启用预热
+	Preheating bool // 是否启用缓存预热
 }
 
 // DefaultCacheOptions 默认缓存配置
@@ -24,6 +44,7 @@ var DefaultCacheOptions = CacheOptions{
 	EvictionType: "lru",                  // 默认使用LRU淘汰策略
 	Compression:  DefaultCompressOptions, // 默认压缩选项
 	Monitoring:   DefaultMonitorOptions,  // 默认监控选项
+	Preheating:   false,                  // 默认不启用预热
 }
 
 // CacheKey 缓存键结构
@@ -34,6 +55,37 @@ type CacheKey struct {
 	Part    int
 }
 
+// String 返回缓存键的字符串表示
+func (k CacheKey) String() string {
+	// 从对象池获取构建器
+	sb := stringBuilderPool.Get().(*strings.Builder)
+	sb.Reset()
+
+	// 预分配足够容量
+	sb.Grow(64)
+
+	// 构建键字符串
+	sb.WriteString(k.Id)
+	sb.WriteByte('_')
+	if k.SansEnv {
+		sb.WriteString("true")
+	} else {
+		sb.WriteString("false")
+	}
+	sb.WriteByte('_')
+	sb.WriteString(strconv.Itoa(k.Theme))
+	sb.WriteByte('_')
+	sb.WriteString(strconv.Itoa(k.Part))
+
+	// 获取结果
+	result := sb.String()
+
+	// 归还构建器
+	stringBuilderPool.Put(sb)
+
+	return result
+}
+
 // CacheItem 缓存项结构
 type CacheItem struct {
 	SVG          string    // SVG内容
@@ -41,6 +93,15 @@ type CacheItem struct {
 	IsCompressed bool      // 是否已压缩
 	CreatedAt    time.Time // 创建时间
 	LastUsed     time.Time // 最后使用时间
+}
+
+// Reset 重置缓存项以便重用
+func (item *CacheItem) Reset() {
+	item.SVG = ""
+	item.Compressed = nil
+	item.IsCompressed = false
+	item.CreatedAt = time.Time{}
+	item.LastUsed = time.Time{}
 }
 
 // PNCache SVG缓存结构
@@ -58,7 +119,7 @@ type PNCache struct {
 func NewCache(options CacheOptions) *PNCache {
 	cache := &PNCache{
 		Options:      options,
-		Items:        make(map[CacheKey]*list.Element),
+		Items:        make(map[CacheKey]*list.Element, options.Size),
 		EvictionList: list.New(),
 		Hits:         0,
 		Misses:       0,
@@ -103,6 +164,11 @@ func (c *PNCache) Get(key CacheKey) (string, bool) {
 			// 删除过期项
 			c.EvictionList.Remove(element)
 			delete(c.Items, key)
+
+			// 将缓存项归还到对象池
+			cacheItem.Reset()
+			cacheItemPool.Put(cacheItem)
+
 			c.Misses++
 			return "", false
 		}
@@ -178,15 +244,15 @@ func (c *PNCache) Set(key CacheKey, svg string) {
 		c.evictItem()
 	}
 
-	// 创建新的缓存项
+	// 从对象池获取新的缓存项
 	now := time.Now()
-	cacheItem := &CacheItem{
-		SVG:          svg,
-		Compressed:   compressed,
-		IsCompressed: isCompressed,
-		CreatedAt:    now,
-		LastUsed:     now,
-	}
+	cacheItem := cacheItemPool.Get().(*CacheItem)
+	cacheItem.Reset()
+	cacheItem.SVG = svg
+	cacheItem.Compressed = compressed
+	cacheItem.IsCompressed = isCompressed
+	cacheItem.CreatedAt = now
+	cacheItem.LastUsed = now
 
 	// 添加到链表和映射
 	element := c.EvictionList.PushFront(cacheItem)
@@ -214,6 +280,9 @@ func (c *PNCache) evictItem() {
 		// 从链表中移除
 		c.EvictionList.Remove(element)
 
+		// 获取缓存项并归还到对象池
+		cacheItem := element.Value.(*CacheItem)
+
 		// 从映射中找到并删除对应的键
 		for k, v := range c.Items {
 			if v == element {
@@ -221,6 +290,10 @@ func (c *PNCache) evictItem() {
 				break
 			}
 		}
+
+		// 重置并归还缓存项
+		cacheItem.Reset()
+		cacheItemPool.Put(cacheItem)
 	}
 }
 
@@ -229,7 +302,14 @@ func (c *PNCache) Clear() {
 	c.Mutex.Lock()
 	defer c.Mutex.Unlock()
 
-	c.Items = make(map[CacheKey]*list.Element)
+	// 归还所有缓存项到对象池
+	for e := c.EvictionList.Front(); e != nil; e = e.Next() {
+		item := e.Value.(*CacheItem)
+		item.Reset()
+		cacheItemPool.Put(item)
+	}
+
+	c.Items = make(map[CacheKey]*list.Element, c.Options.Size)
 	c.EvictionList = list.New()
 	c.Hits = 0
 	c.Misses = 0
@@ -277,6 +357,9 @@ func (c *PNCache) RemoveExpired() int {
 			c.EvictionList.Remove(element)
 			// 从映射中删除
 			delete(c.Items, key)
+			// 归还缓存项到对象池
+			cacheItem.Reset()
+			cacheItemPool.Put(cacheItem)
 			count++
 		}
 	}
@@ -357,11 +440,18 @@ func (c *PNCache) DeleteItem(key CacheKey) bool {
 		return false
 	}
 
+	// 获取缓存项
+	cacheItem := element.Value.(*CacheItem)
+
 	// 从链表中移除
 	c.EvictionList.Remove(element)
 
 	// 从映射中删除
 	delete(c.Items, key)
+
+	// 重置并归还缓存项
+	cacheItem.Reset()
+	cacheItemPool.Put(cacheItem)
 
 	return true
 }

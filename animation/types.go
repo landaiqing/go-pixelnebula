@@ -2,6 +2,23 @@ package animation
 
 import (
 	"strings"
+	"sync"
+)
+
+var (
+	// 字符串构建器对象池
+	animationBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return new(strings.Builder)
+		},
+	}
+
+	// 动画映射对象池
+	animationMapPool = sync.Pool{
+		New: func() interface{} {
+			return make(map[string]string)
+		},
+	}
 )
 
 // AnimationType 表示动画类型
@@ -26,6 +43,8 @@ type Animation interface {
 	GenerateSVG() string
 	// GetTargetID 获取目标元素ID
 	GetTargetID() string
+	// GetType 获取动画类型
+	GetType() AnimationType
 }
 
 // BaseAnimation 基础动画结构，包含所有动画共有的属性
@@ -43,20 +62,20 @@ func (a *BaseAnimation) GetTargetID() string {
 	return a.TargetID
 }
 
+// GetType 获取动画类型
+func (a *BaseAnimation) GetType() AnimationType {
+	return a.Type
+}
+
 // Manager 动画管理器，负责管理所有动画
 type Manager struct {
 	animations []Animation
 }
 
-// GetAnimations 获取所有动画
-func (m *Manager) GetAnimations() []Animation {
-	return m.animations
-}
-
 // NewAnimationManager 创建一个新的动画管理器
 func NewAnimationManager() *Manager {
 	return &Manager{
-		animations: make([]Animation, 0),
+		animations: make([]Animation, 0, 10), // 预分配容量
 	}
 }
 
@@ -65,25 +84,63 @@ func (m *Manager) AddAnimation(animation Animation) {
 	m.animations = append(m.animations, animation)
 }
 
+// GetAnimations 获取所有动画
+func (m *Manager) GetAnimations() []Animation {
+	return m.animations
+}
+
+// GetAnimationsByType 获取指定类型的动画
+func (m *Manager) GetAnimationsByType(animType AnimationType) []Animation {
+	// 预分配足够容量
+	result := make([]Animation, 0, len(m.animations)/2)
+
+	for _, anim := range m.animations {
+		if anim.GetType() == animType {
+			result = append(result, anim)
+		}
+	}
+
+	return result
+}
+
 // GenerateSVGAnimations 生成SVG动画代码
 func (m *Manager) GenerateSVGAnimations() string {
 	if len(m.animations) == 0 {
 		return ""
 	}
 
-	var sb strings.Builder
+	// 从对象池获取构建器
+	sb := animationBuilderPool.Get().(*strings.Builder)
+	sb.Reset()
+	sb.Grow(1024) // 预分配足够的容量
+	defer animationBuilderPool.Put(sb)
 
 	// 添加SVG命名空间声明
 	sb.WriteString("<defs>\n")
 
-	// 用于存储需要放在defs中的定义
-	var defsContent strings.Builder
-	// 用于存储需要直接添加到SVG中的动画元素
-	var animationsContent strings.Builder
-	// 用于存储旋转动画的映射，键为目标元素ID
-	rotateAnimations := make(map[string]string)
+	// 获取定义内容构建器
+	defsContent := animationBuilderPool.Get().(*strings.Builder)
+	defsContent.Reset()
+	defsContent.Grow(512)
+	defer animationBuilderPool.Put(defsContent)
 
-	// 处理所有动画
+	// 获取动画内容构建器
+	animationsContent := animationBuilderPool.Get().(*strings.Builder)
+	animationsContent.Reset()
+	animationsContent.Grow(512)
+	defer animationBuilderPool.Put(animationsContent)
+
+	// 获取旋转动画映射
+	rotateAnimations := animationMapPool.Get().(map[string]string)
+	defer func() {
+		// 清空映射并归还
+		for k := range rotateAnimations {
+			delete(rotateAnimations, k)
+		}
+		animationMapPool.Put(rotateAnimations)
+	}()
+
+	// 一次性处理所有动画以减少循环开销
 	for _, anim := range m.animations {
 		svgCode := anim.GenerateSVG()
 		if svgCode == "" {
@@ -91,16 +148,15 @@ func (m *Manager) GenerateSVGAnimations() string {
 		}
 
 		// 根据动画类型决定放置位置
-		switch a := anim.(type) {
-		case *GradientAnimation:
+		switch anim.GetType() {
+		case Gradient:
 			// 渐变定义需要放在defs中
 			defsContent.WriteString(svgCode)
-		case *RotateAnimation:
+		case Rotate:
 			// 旋转动画需要包裹目标元素，先存储起来
-			// 提取animateTransform标签
 			if start := strings.Index(svgCode, "<animateTransform"); start != -1 {
 				if end := strings.Index(svgCode[start:], "/>"); end != -1 {
-					rotateAnimations[a.GetTargetID()] = svgCode[start : start+end+2]
+					rotateAnimations[anim.GetTargetID()] = svgCode[start : start+end+2]
 				}
 			}
 		default:

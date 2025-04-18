@@ -144,7 +144,7 @@ func TestDemo(t *testing.T) {
 	pn := NewPixelNebula()
 
 	// 设置风格和尺寸
-	pn.WithStyle(style.MechStyle)
+	pn.WithStyle(style.MetaStyle)
 	pn.WithTheme(1)
 	pn.WithSize(231, 231)
 

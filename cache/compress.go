@@ -5,60 +5,95 @@ import (
 	"compress/gzip"
 	"io"
 	"strings"
+	"sync"
 )
 
-// CompressOptions 压缩选项
+var (
+	// 字符串构建器对象池
+	optimizeBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return new(strings.Builder)
+		},
+	}
+
+	// Gzip Writer对象池
+	gzipWriterPool = sync.Pool{
+		New: func() interface{} {
+			writer, _ := gzip.NewWriterLevel(nil, gzip.BestCompression)
+			return writer
+		},
+	}
+
+	// Gzip Reader对象池
+	gzipReaderPool = sync.Pool{
+		New: func() interface{} {
+			return new(gzip.Reader)
+		},
+	}
+
+	// 字节缓冲区对象池
+	bytesBufferPool = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
+)
+
+// CompressOptions 压缩配置选项
 type CompressOptions struct {
-	Enabled      bool    // 是否启用压缩
-	Level        int     // 压缩级别 (1-9)，1为最快压缩，9为最佳压缩
-	MinSizeBytes int     // 最小压缩大小，小于此大小的数据不进行压缩
-	Ratio        float64 // 压缩比阈值，压缩后大小/原始大小，小于此值才保存压缩结果
+	Enabled          bool    // 是否启用压缩
+	Level            int     // 压缩级别，范围从-2(不压缩)到9(最高压缩)
+	MinSize          int     // 最小压缩大小，小于此大小的SVG不压缩
+	CompressionRatio float64 // 最小压缩比率，压缩后大小/原始大小，小于此比率才使用压缩结果
 }
 
-// DefaultCompressOptions 默认压缩选项
+// DefaultCompressOptions 默认压缩配置
 var DefaultCompressOptions = CompressOptions{
-	Enabled:      true,
-	Level:        6,   // 默认压缩级别为6，平衡压缩率和性能
-	MinSizeBytes: 100, // 默认最小压缩大小为100字节
-	Ratio:        0.9, // 默认压缩比阈值为0.9，即至少要压缩到原始大小的90%以下才保存压缩结果
+	Enabled:          true,
+	Level:            9,    // 默认使用最高压缩级别
+	MinSize:          1024, // 默认最小压缩大小为1KB
+	CompressionRatio: 0.8,  // 默认最小压缩比率为0.8
 }
 
-// CompressSVG 压缩SVG数据
-// 返回压缩后的数据和是否进行了压缩
+// CompressSVG 压缩SVG字符串
 func CompressSVG(svg string, options CompressOptions) ([]byte, bool) {
-	if !options.Enabled || len(svg) < options.MinSizeBytes {
+	if !options.Enabled {
 		return []byte(svg), false
 	}
 
-	// 创建一个bytes.Buffer来存储压缩数据
-	var buf bytes.Buffer
-
-	// 创建一个gzip.Writer，设置压缩级别
-	writer, err := gzip.NewWriterLevel(&buf, options.Level)
-	if err != nil {
+	// 如果SVG太小，不进行压缩
+	if len(svg) < options.MinSize {
 		return []byte(svg), false
 	}
 
-	// 写入SVG数据
-	_, err = writer.Write([]byte(svg))
-	if err != nil {
+	// 从对象池获取缓冲区
+	buf := bytesBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bytesBufferPool.Put(buf)
+
+	// 从对象池获取gzip写入器
+	writer := gzipWriterPool.Get().(*gzip.Writer)
+	writer.Reset(buf)
+	defer gzipWriterPool.Put(writer)
+
+	// 写入数据
+	if _, err := writer.Write([]byte(svg)); err != nil {
 		return []byte(svg), false
 	}
 
-	// 关闭writer，确保所有数据都被写入
-	err = writer.Close()
-	if err != nil {
+	// 关闭写入器
+	if err := writer.Close(); err != nil {
 		return []byte(svg), false
 	}
 
 	// 获取压缩后的数据
-	compressed := buf.Bytes()
+	compressed := make([]byte, buf.Len())
+	copy(compressed, buf.Bytes())
 
-	// 计算压缩比
+	// 计算压缩比率
 	ratio := float64(len(compressed)) / float64(len(svg))
-
-	// 如果压缩比不理想，返回原始数据
-	if ratio >= options.Ratio {
+	if ratio > options.CompressionRatio {
+		// 压缩效果不好，返回原始数据
 		return []byte(svg), false
 	}
 
@@ -77,7 +112,12 @@ func DecompressSVG(data []byte, isCompressed bool) (string, error) {
 		return string(data), nil
 	}
 
-	// 创建一个gzip.Reader
+	// 获取缓冲区
+	buf := bytesBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bytesBufferPool.Put(buf)
+
+	// 创建Reader
 	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return string(data), err
@@ -85,12 +125,11 @@ func DecompressSVG(data []byte, isCompressed bool) (string, error) {
 	defer reader.Close()
 
 	// 读取解压缩后的数据
-	decompressed, err := io.ReadAll(reader)
-	if err != nil {
+	if _, err := io.Copy(buf, reader); err != nil {
 		return string(data), err
 	}
 
-	return string(decompressed), nil
+	return buf.String(), nil
 }
 
 // isGzipped 检查数据是否为gzip格式
@@ -101,6 +140,11 @@ func isGzipped(data []byte) bool {
 
 // OptimizeSVG 优化SVG字符串，移除不必要的空白和注释
 func OptimizeSVG(svg string) string {
+	// 如果SVG太小，不进行优化
+	if len(svg) < 100 {
+		return svg
+	}
+
 	// 移除XML注释
 	svg = removeXMLComments(svg)
 
@@ -110,33 +154,100 @@ func OptimizeSVG(svg string) string {
 	return svg
 }
 
-// removeXMLComments 移除XML注释
+// removeXMLComments 移除XML注释 - 优化版本
 func removeXMLComments(svg string) string {
-	for {
-		start := strings.Index(svg, "<!--")
-		if start == -1 {
-			break
-		}
-		end := strings.Index(svg[start:], "-->") + start
-		if end > start {
-			svg = svg[:start] + svg[end+3:]
+	// 获取构建器
+	sb := optimizeBuilderPool.Get().(*strings.Builder)
+	sb.Reset()
+	sb.Grow(len(svg))
+	defer optimizeBuilderPool.Put(sb)
+
+	for i := 0; i < len(svg); {
+		// 检查是否遇到注释开始
+		if i+3 < len(svg) && svg[i] == '<' && svg[i+1] == '!' && svg[i+2] == '-' && svg[i+3] == '-' {
+			// 查找注释结束
+			end := i + 4
+			for end+2 <= len(svg) {
+				if svg[end] == '-' && svg[end+1] == '-' && svg[end+2] == '>' {
+					end += 3
+					break
+				}
+				end++
+			}
+			// 跳过注释
+			i = end
 		} else {
-			break
+			// 添加非注释字符
+			sb.WriteByte(svg[i])
+			i++
 		}
 	}
-	return svg
+
+	return sb.String()
 }
 
-// removeExtraWhitespace 移除多余的空白
+// removeExtraWhitespace 移除多余的空白 - 优化版本
 func removeExtraWhitespace(svg string) string {
-	// 替换多个空白字符为单个空格
-	svg = strings.Join(strings.Fields(svg), " ")
+	// 获取构建器
+	sb := optimizeBuilderPool.Get().(*strings.Builder)
+	sb.Reset()
+	sb.Grow(len(svg))
+	defer optimizeBuilderPool.Put(sb)
 
-	// 优化常见的SVG标签周围的空白
-	svg = strings.ReplaceAll(svg, "> <", "><")
-	svg = strings.ReplaceAll(svg, " />", "/>")
-	svg = strings.ReplaceAll(svg, " =", "=")
-	svg = strings.ReplaceAll(svg, "= ", "=")
+	inTag := false
+	inQuote := false
+	quoteChar := byte(0)
+	lastWasSpace := false
 
-	return svg
+	for i := 0; i < len(svg); i++ {
+		c := svg[i]
+
+		// 处理引号内的内容
+		if inQuote {
+			sb.WriteByte(c)
+			if c == quoteChar {
+				inQuote = false
+			}
+			continue
+		}
+
+		// 处理标签
+		if c == '<' {
+			inTag = true
+			lastWasSpace = false
+			sb.WriteByte(c)
+			continue
+		}
+
+		if c == '>' {
+			inTag = false
+			lastWasSpace = false
+			sb.WriteByte(c)
+			continue
+		}
+
+		// 处理引号开始
+		if (c == '"' || c == '\'') && inTag {
+			inQuote = true
+			quoteChar = c
+			sb.WriteByte(c)
+			continue
+		}
+
+		// 处理空白字符
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			// 压缩连续空白
+			if !lastWasSpace && (inTag || i > 0 && svg[i-1] != '>') {
+				sb.WriteByte(' ')
+				lastWasSpace = true
+			}
+			continue
+		}
+
+		// 处理普通字符
+		lastWasSpace = false
+		sb.WriteByte(c)
+	}
+
+	return sb.String()
 }

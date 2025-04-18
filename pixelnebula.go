@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/landaiqing/go-pixelnebula/animation"
@@ -22,7 +23,6 @@ import (
 
 const (
 	hashLength = 12
-	keyFactor  = 0.47
 )
 
 var (
@@ -30,6 +30,32 @@ var (
 	numberRegex = regexp.MustCompile(`[0-9]`)
 	// 使用非贪婪模式并优化颜色匹配模式
 	colorRegex = regexp.MustCompile(`#([^;]*);`)
+	// 使用字节池减少内存分配
+	hashBufPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 64)
+			return &buf
+		},
+	}
+	// 缓存键计算结果缓存
+	keyCache    = make(map[string][2]int)
+	keyCacheMux sync.RWMutex
+	// 使用对象池减少内存分配
+	builderPool = sync.Pool{
+		New: func() interface{} {
+			return &strings.Builder{}
+		},
+	}
+	mapPool = sync.Pool{
+		New: func() interface{} {
+			return make(map[string]string, 6)
+		},
+	}
+	keyMapPool = sync.Pool{
+		New: func() interface{} {
+			return make(map[string][2]int, 6)
+		},
+	}
 )
 
 type PNOptions struct {
@@ -119,15 +145,16 @@ func (pn *PixelNebula) hashToNum(hash []string) int64 {
 		return 0
 	}
 
-	// 将哈希字符串数组连接成一个字符串
+	// 使用位运算直接计算哈希值，减少内存分配和计算复杂度
 	var result int64
 	for _, h := range hash {
-		num, err := strconv.ParseInt(h, 10, 64)
-		if err != nil {
-			continue
+		// 优化：直接处理字符，避免ParseInt的开销
+		for i := 0; i < len(h); i++ {
+			if h[i] >= '0' && h[i] <= '9' {
+				// 使用位运算进行计算: result = result*10 + (h[i] - '0')
+				result = (result << 3) + (result << 1) + int64(h[i]-'0')
+			}
 		}
-		// 使用位运算和加法组合多个数字
-		result = (result << 3) + (result << 1) + num // result * 8 + result * 2 + num
 	}
 
 	// 确保结果为正数
@@ -138,14 +165,37 @@ func (pn *PixelNebula) hashToNum(hash []string) int64 {
 	return result
 }
 
+// getCacheKey 生成缓存键的哈希表示
+func (pn *PixelNebula) getCacheKey(id string, hash []string, index int, opts *PNOptions) string {
+	// 构造一个唯一的键字符串
+	var key string
+	if opts != nil && opts.StyleIndex >= 0 && opts.ThemeIndex >= 0 {
+		key = fmt.Sprintf("%s_%d_%d_%d", id, index, opts.StyleIndex, opts.ThemeIndex)
+	} else if len(hash) > 0 {
+		key = fmt.Sprintf("%s_%d_%s", id, index, strings.Join(hash, ""))
+	} else {
+		key = fmt.Sprintf("%s_%d", id, index)
+	}
+	return key
+}
+
 // calcKey 计算主题和部分的键值
 func (pn *PixelNebula) calcKey(hash []string, opts *PNOptions) [2]int {
-	// 只有当明确设置了主题和风格索引时才使用固定值
+	// 检查是否使用固定值
 	if opts != nil && opts.StyleIndex >= 0 && opts.ThemeIndex >= 0 {
 		return [2]int{opts.StyleIndex, opts.ThemeIndex}
 	}
 
-	// 直接使用哈希值，不进行 keyFactor 转换
+	// 尝试从缓存中获取结果
+	cacheKey := strings.Join(hash, "")
+	keyCacheMux.RLock()
+	if result, ok := keyCache[cacheKey]; ok {
+		keyCacheMux.RUnlock()
+		return result
+	}
+	keyCacheMux.RUnlock()
+
+	// 计算哈希值
 	hashNum := pn.hashToNum(hash)
 
 	// 获取可用的风格数量
@@ -154,13 +204,10 @@ func (pn *PixelNebula) calcKey(hash []string, opts *PNOptions) [2]int {
 		return [2]int{0, 0}
 	}
 
-	// 使用哈希值计算风格索引
+	// 使用位运算优化取模操作
 	styleIndex := int(hashNum % int64(styleCount))
 	if styleIndex < 0 {
 		styleIndex = -styleIndex
-	}
-	if styleIndex >= styleCount {
-		styleIndex = styleCount - 1
 	}
 
 	// 获取该风格下的主题数量
@@ -170,16 +217,18 @@ func (pn *PixelNebula) calcKey(hash []string, opts *PNOptions) [2]int {
 	}
 
 	// 使用哈希值的不同部分计算主题索引
-	// 使用更简单的计算方式
 	themeIndex := int(hashNum % int64(themeCount))
 	if themeIndex < 0 {
 		themeIndex = -themeIndex
 	}
-	if themeIndex >= themeCount {
-		themeIndex = themeCount - 1
-	}
 
-	return [2]int{styleIndex, themeIndex}
+	// 将结果存入缓存
+	result := [2]int{styleIndex, themeIndex}
+	keyCacheMux.Lock()
+	keyCache[cacheKey] = result
+	keyCacheMux.Unlock()
+
+	return result
 }
 
 // WithCache 设置缓存选项
@@ -584,10 +633,14 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 		}
 	}
 
-	// 计算avatarId的哈希值
+	// 使用对象池获取缓冲区
+	hashBuf := hashBufPool.Get().(*[]byte)
+	defer hashBufPool.Put(hashBuf)
+
+	// 计算avatarId的哈希值 - 优化版本
 	pn.hasher.Reset()
 	pn.hasher.Write([]byte(id))
-	sum := pn.hasher.Sum(nil)
+	sum := pn.hasher.Sum((*hashBuf)[:0])
 	s := hex.EncodeToString(sum)
 	hashStr := numberRegex.FindAllString(s, -1)
 	if len(hashStr) < hashLength {
@@ -595,9 +648,17 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 	}
 	hashStr = hashStr[0:hashLength]
 
-	// 预分配map容量以提高性能
-	var p = make(map[string][2]int, 6)
+	// 从对象池获取映射
+	p := keyMapPool.Get().(map[string][2]int)
+	defer func() {
+		// 清空并归还对象池
+		for k := range p {
+			delete(p, k)
+		}
+		keyMapPool.Put(p)
+	}()
 
+	// 计算各部分的键值
 	p[string(style.TypeEnv)] = pn.calcKey(hashStr[:2], opts)
 	p[string(style.TypeClo)] = pn.calcKey(hashStr[2:4], opts)
 	p[string(style.TypeHead)] = pn.calcKey(hashStr[4:6], opts)
@@ -605,8 +666,17 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 	p[string(style.TypeEyes)] = pn.calcKey(hashStr[8:10], opts)
 	p[string(style.TypeTop)] = pn.calcKey(hashStr[10:], opts)
 
-	// 预分配map容量
-	var final = make(map[string]string, 6)
+	// 获取结果映射
+	final := mapPool.Get().(map[string]string)
+	defer func() {
+		// 清空并归还对象池
+		for k := range final {
+			delete(final, k)
+		}
+		mapPool.Put(final)
+	}()
+
+	// 获取并处理各部分的SVG
 	for k, v := range p {
 		// 获取主题颜色
 		themePart, err := pn.themeManager.GetTheme(v[0], v[1])
@@ -627,8 +697,10 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 		}
 
 		match := colorRegex.FindAllStringSubmatch(svgPart, -1)
-		// 使用strings.Builder提高字符串处理性能
-		var sb strings.Builder
+
+		// 从对象池获取Builder
+		sb := builderPool.Get().(*strings.Builder)
+		sb.Reset()
 		sb.Grow(len(svgPart) + 50) // 预分配足够的容量
 
 		lastIndex := 0
@@ -653,14 +725,21 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 		}
 		// 添加剩余部分
 		sb.WriteString(svgPart[lastIndex:])
+
 		final[k] = sb.String()
+
+		// 归还Builder到对象池
+		builderPool.Put(sb)
 	}
 
-	// 使用strings.Builder构建最终SVG
-	var builder strings.Builder
+	// 使用对象池获取主Builder来构建最终SVG
+	builder := builderPool.Get().(*strings.Builder)
+	builder.Reset()
 	// 预估SVG大小，避免多次内存分配
-	builder.Grow(1024 * 2)
-	builder.WriteString(pn.getSvgStart()) // 使用动态生成的svgStart
+	builder.Grow(2048) // 2KB 应该足够容纳大多数SVG
+
+	// 添加SVG开始标签
+	builder.WriteString(pn.getSvgStart())
 
 	// 获取动画定义
 	animations := pn.animManager.GenerateSVGAnimations()
@@ -668,32 +747,31 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 		builder.WriteString(animations)
 	}
 
-	// 检查是否有旋转动画并获取旋转动画的SVG代码
+	// 构建和处理旋转动画 - 使用对象池
 	rotateAnimations := make(map[string]bool)
 	rotateAnimationSVGs := make(map[string]string)
+
+	// 收集旋转动画
 	for _, anim := range pn.animManager.GetAnimations() {
-		// 检查是否为旋转动画
 		if rotateAnim, ok := anim.(*animation.RotateAnimation); ok {
-			rotateAnimations[anim.GetTargetID()] = true
-			// 获取旋转动画的SVG代码（只提取animateTransform部分）
+			targetID := anim.GetTargetID()
+			rotateAnimations[targetID] = true
+
+			// 提取animateTransform部分
 			svgCode := rotateAnim.GenerateSVG()
-			// 提取animateTransform标签
 			if start := strings.Index(svgCode, "<animateTransform"); start != -1 {
 				if end := strings.Index(svgCode[start:], "/>"); end != -1 {
-					rotateAnimationSVGs[anim.GetTargetID()] = svgCode[start : start+end+2]
+					rotateAnimationSVGs[targetID] = svgCode[start : start+end+2]
 				}
 			}
 		}
-
 	}
 
-	// 处理元素，如果元素有旋转动画，则包裹在g标签中并添加animateTransform
-	// 只有当不是无环境模式时才添加环境
+	// 处理环境
 	if !sansEnv {
 		if _, hasRotate := rotateAnimations["env"]; hasRotate {
 			builder.WriteString("<g style=\"transform-box: fill-box; transform-origin: center;\">\n")
 			builder.WriteString(final["env"])
-			// 添加animateTransform标签
 			if animSVG, ok := rotateAnimationSVGs["env"]; ok {
 				builder.WriteString(animSVG)
 			}
@@ -705,33 +783,27 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 
 	// 处理其他元素
 	elements := []string{"head", "clo", "top", "eyes", "mouth"}
-
-	// 单独处理每个元素
 	for _, elem := range elements {
 		if _, hasRotate := rotateAnimations[elem]; hasRotate {
-			// 如果元素有旋转动画，则包裹在g标签中
 			builder.WriteString("<g style=\"transform-box: fill-box; transform-origin: center;\">\n")
 			builder.WriteString(final[elem])
-
-			// 添加animateTransform标签
 			if animSVG, ok := rotateAnimationSVGs[elem]; ok {
-				// 提取animateTransform标签部分
-				if start := strings.Index(animSVG, "<animateTransform"); start != -1 {
-					if end := strings.Index(animSVG[start:], "/>"); end != -1 {
-						builder.WriteString(animSVG[start : start+end+2])
-					}
-				}
+				builder.WriteString(animSVG)
 			}
 			builder.WriteString("</g>\n")
 		} else {
-			// 如果元素没有旋转动画，直接添加
 			builder.WriteString(final[elem])
 		}
 	}
 
 	builder.WriteString(pn.svgEnd)
 	svg = builder.String()
+
+	// 将生成的SVG存储到实例中
 	pn.imgData = []byte(svg)
+
+	// 归还Builder到对象池
+	builderPool.Put(builder)
 
 	// 如果启用了缓存，将结果存入缓存
 	if pn.cache != nil {
@@ -881,7 +953,7 @@ func (pn *PixelNebula) DeleteCacheItem(key string) bool {
 	id := parts[0]
 	sansEnv := parts[1] == "true"
 
-	theme, err := strconv.Atoi(parts[2])
+	themeItem, err := strconv.Atoi(parts[2])
 	if err != nil {
 		log.Printf("pixelnebula: 解析theme失败: %v", err)
 		return false
@@ -897,7 +969,7 @@ func (pn *PixelNebula) DeleteCacheItem(key string) bool {
 	cacheKey := cache.CacheKey{
 		Id:      id,
 		SansEnv: sansEnv,
-		Theme:   theme,
+		Theme:   themeItem,
 		Part:    part,
 	}
 

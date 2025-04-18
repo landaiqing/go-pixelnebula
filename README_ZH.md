@@ -18,8 +18,8 @@
 
 <div align="center" style="margin-bottom: 20px; padding: 15px; border-radius: 10px;">
   <a href="https://pkg.go.dev/github.com/landaiqing/go-pixelnebula"><img src="https://img.shields.io/badge/go-reference-blue?style=flat-square&logo=go" alt="Go Reference"></a>
-  <a href="https://goreportcard.com/"><img src="https://img.shields.io/badge/go%20report-A+-brightgreen?style=flat-square&logo=go" alt="Go Report Card"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square&logo=github" alt="License"></a>
+  <a href="https://goreportcard.com/report/github.com/landaiqing/go-pixelnebula"><img src="https://img.shields.io/badge/go%20report-A+-brightgreen?style=flat-square&logo=go" alt="Go Report Card"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache-green?style=flat-square&logo=github" alt="License"></a>
   <a href="https://github.com/landaiqing/go-pixelnebula/releases"><img src="https://img.shields.io/badge/version-0.1.0-blue?style=flat-square&logo=github" alt="Version"></a>
 </div>
 
@@ -615,7 +615,7 @@ go test -bench=. -benchmem
 
 ## 📄 许可证
 
-该项目采用 MIT 许可证 - 详情请查看 [LICENSE](LICENSE) 文件。
+该项目采用 Apache 2.0 许可证 - 详情请查看 [LICENSE](LICENSE) 文件。
 
 <hr/>
 

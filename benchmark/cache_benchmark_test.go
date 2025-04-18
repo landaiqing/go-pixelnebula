@@ -83,13 +83,33 @@ func BenchmarkCacheSizes(b *testing.B) {
 // BenchmarkCacheCompression 测试缓存压缩对性能的影响
 func BenchmarkCacheCompression(b *testing.B) {
 	compressionLevels := []struct {
-		name  string
-		level int
+		name    string
+		options cache.CompressOptions
 	}{
-		{"NoCompression", 0},
-		{"LowCompression", 3},
-		{"MediumCompression", 6},
-		{"HighCompression", 9},
+		{
+			name: "NoCompression",
+			options: cache.CompressOptions{
+				Enabled: false,
+			},
+		},
+		{
+			name: "DefaultCompression",
+			options: cache.CompressOptions{
+				Enabled:          true,
+				Level:            5,    // 默认压缩级别
+				MinSize:          1024, // 最小压缩大小
+				CompressionRatio: 0.8,  // 最小压缩比率
+			},
+		},
+		{
+			name: "BestCompression",
+			options: cache.CompressOptions{
+				Enabled:          true,
+				Level:            9,    // 最高压缩级别
+				MinSize:          1024, // 最小压缩大小
+				CompressionRatio: 0.8,  // 最小压缩比率
+			},
+		},
 	}
 
 	for _, cl := range compressionLevels {
@@ -100,12 +120,8 @@ func BenchmarkCacheCompression(b *testing.B) {
 			pn.WithSize(231, 231)
 			pn.WithDefaultCache()
 
-			if cl.level > 0 {
-				pn.WithCompression(cache.CompressOptions{
-					Enabled:      true,
-					Level:        cl.level,
-					MinSizeBytes: 100,
-				})
+			if cl.options.Enabled {
+				pn.WithCompression(cl.options)
 			}
 
 			b.ResetTimer()
