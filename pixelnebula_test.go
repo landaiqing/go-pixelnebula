@@ -144,7 +144,8 @@ func TestDemo(t *testing.T) {
 	pn := NewPixelNebula()
 
 	// 设置风格和尺寸
-	pn.WithStyle(style.GirlStyle)
+	pn.WithStyle(style.MechStyle)
+	pn.WithTheme(1)
 	pn.WithSize(231, 231)
 
 	// 生成 SVG 并保存到文件

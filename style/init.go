@@ -166,6 +166,24 @@ var defaultStyleSet = map[StyleType]StyleSet{
 		TypeHead:  "<path id='head'  d=\"m50 50h130v130h-130z\" style=\"fill:#000;\"/>",
 		TypeEnv:   "<path id='env'   d=\"m30 30h170v170h-170z\" style=\"fill:#01;\"/>",
 	},
+
+	// NeonStyle 风格
+	NeonStyle: NeonStyleShapes,
+
+	// PixelStyle 风格
+	PixelStyle: PixelStyleShapes,
+
+	// WatercolorStyle 风格
+	WatercolorStyle: WatercolorStyleShapes,
+
+	// MechStyle 风格
+	MechStyle: MechStyleShapes,
+
+	// CosmicStyle 风格
+	CosmicStyle: CosmicStyleShapes,
+
+	// GhostStyle 风格
+	GhostStyle: GhostStyleShapes,
 }
 
 // initShapes 初始化形状数据
@@ -188,6 +206,12 @@ func (m *Manager) initShapes() {
 		RastaStyle,
 		MetaStyle,
 		SquareStyle,
+		NeonStyle,       // 霓虹风格
+		PixelStyle,      // 像素风格
+		WatercolorStyle, // 水彩风格
+		MechStyle,       // 机械风格
+		CosmicStyle,     // 宇宙风格
+		GhostStyle,      // 幽灵风格
 	} {
 		if styleSet, exists := defaultStyleSet[style]; exists {
 			m.AddStyleSet(styleSet)

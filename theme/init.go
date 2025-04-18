@@ -484,6 +484,24 @@ var defaultThemeSet = map[style.StyleType]Theme{
 			"top":   {"#00fffd", "none", "none", "none", "none"},
 		},
 	},
+
+	// 添加NeonStyle主题
+	style.NeonStyle: NeonTheme,
+
+	// 添加PixelStyle主题
+	style.PixelStyle: PixelTheme,
+
+	// 添加WatercolorStyle主题
+	style.WatercolorStyle: WatercolorTheme,
+
+	// 添加MechStyle主题
+	style.MechStyle: MechTheme,
+
+	// 添加CosmicStyle主题
+	style.CosmicStyle: CosmicTheme,
+
+	// 添加GhostStyle主题
+	style.GhostStyle: GhostTheme,
 }
 
 // initThemes 初始化主题数据
@@ -507,6 +525,12 @@ func (m *Manager) initThemes() {
 		style.RastaStyle,
 		style.MetaStyle,
 		style.SquareStyle,
+		style.NeonStyle,       // 霓虹风格主题
+		style.PixelStyle,      // 像素风格主题
+		style.WatercolorStyle, // 水彩风格主题
+		style.MechStyle,       // 机械风格主题
+		style.CosmicStyle,     // 宇宙风格主题
+		style.GhostStyle,      // 幽灵风格主题
 	} {
 		if themeSet, exists := defaultThemeSet[theme]; exists {
 			m.AddTheme(themeSet)

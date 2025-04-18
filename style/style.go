@@ -106,6 +106,12 @@ func (m *Manager) GetStyleIndex(style StyleType) (int, error) {
 		RastaStyle,
 		MetaStyle,
 		SquareStyle,
+		NeonStyle,       // 霓虹风格
+		PixelStyle,      // 像素风格
+		WatercolorStyle, // 水彩风格
+		MechStyle,       // 机械风格
+		CosmicStyle,     // 宇宙风格
+		GhostStyle,      // 幽灵风格
 	} {
 		if s == style {
 			return i, nil
