@@ -7,7 +7,9 @@ import (
 	"hash"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,9 +39,10 @@ var (
 			return &buf
 		},
 	}
-	// 缓存键计算结果缓存
-	keyCache    = make(map[string][2]int)
-	keyCacheMux sync.RWMutex
+	// 使用分片锁减少锁竞争
+	keyCacheShards    = 16 // 分片数量
+	keyCacheLocks     = make([]sync.RWMutex, keyCacheShards)
+	keyCacheShardData = make([]map[string][2]int, keyCacheShards)
 	// 使用对象池减少内存分配
 	builderPool = sync.Pool{
 		New: func() interface{} {
@@ -58,84 +61,103 @@ var (
 	}
 )
 
+// init 初始化分片缓存
+func init() {
+	// 初始化分片缓存
+	for i := 0; i < keyCacheShards; i++ {
+		keyCacheShardData[i] = make(map[string][2]int)
+	}
+}
+
+// 计算字符串哈希获取分片索引
+func getShardIndex(key string) int {
+	var hashKey uint32
+	for i := 0; i < len(key); i++ {
+		hashKey = hashKey*31 + uint32(key[i])
+	}
+	return int(hashKey % uint32(keyCacheShards))
+}
+
 type PNOptions struct {
-	ThemeIndex int // 主题索引，
-	StyleIndex int // 风格索引，
+	ThemeIndex      int  // 主题索引
+	StyleIndex      int  // 风格索引
+	ParallelRender  bool // 是否启用并行渲染
+	ConcurrencyPool int  // 并发池大小，默认为CPU核心数
 }
 
 type PixelNebula struct {
-	svgEnd       string
-	themeManager *theme.Manager
-	styleManager *style.Manager
-	animManager  *animation.Manager
-	cache        *cache.PNCache
-	hasher       hash.Hash
-	options      *PNOptions
-	width        int
-	height       int
-	imgData      []byte
+	SvgEnd       string
+	ThemeManager *theme.Manager
+	StyleManager *style.Manager
+	AnimManager  *animation.Manager
+	Cache        *cache.PNCache
+	Hasher       hash.Hash
+	Options      *PNOptions
+	Width        int
+	Height       int
+	ImgData      []byte
 }
 
 // NewPixelNebula 创建一个PixelNebula实例
 func NewPixelNebula() *PixelNebula {
 	return &PixelNebula{
-		svgEnd:       "</svg>",
-		themeManager: theme.NewThemeManager(),
-		styleManager: style.NewShapeManager(),
-		animManager:  animation.NewAnimationManager(),
-		hasher:       sha256.New(),
-		options:      &PNOptions{ThemeIndex: -1, StyleIndex: -1}, // 初始化为 -1 表示未设置
-		width:        231,
-		height:       231,
+		SvgEnd:       "</svg>",
+		ThemeManager: theme.NewThemeManager(),
+		StyleManager: style.NewShapeManager(),
+		AnimManager:  animation.NewAnimationManager(),
+		Hasher:       sha256.New(),
+		Options:      &PNOptions{ThemeIndex: -1, StyleIndex: -1, ParallelRender: false, ConcurrencyPool: runtime.NumCPU()}, // 初始化为 -1 表示未设置
+		Width:        231,
+		Height:       231,
 	}
 }
 
 // getSvgStart 根据当前宽高生成SVG开始标签
 func (pn *PixelNebula) getSvgStart() string {
-	return fmt.Sprintf("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 %d %d\">", pn.width, pn.height)
+	return fmt.Sprintf("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 %d %d\">", pn.Width, pn.Height)
 }
 
 // WithTheme 设置固定主题
 func (pn *PixelNebula) WithTheme(themeIndex int) *PixelNebula {
 	// 如果已设置 style,则验证主题索引是否有效
-	if styleIndex := pn.options.StyleIndex; styleIndex >= 0 {
+	if styleIndex := pn.Options.StyleIndex; styleIndex >= 0 {
 		// 获取该风格下的主题数量
-		themeCount := pn.themeManager.ThemeCount(styleIndex)
+		themeCount := pn.ThemeManager.ThemeCount(styleIndex)
 		if themeIndex < 0 || themeIndex >= themeCount {
 			log.Printf("pixelnebula: theme index range is:[0, %d), but got %d", themeCount, themeIndex)
 			panic(errors.ErrInvalidTheme)
 		}
 	}
-	pn.options.ThemeIndex = themeIndex
+	pn.Options.ThemeIndex = themeIndex
 	return pn
 }
 
 // WithStyle 设置固定风格
 func (pn *PixelNebula) WithStyle(style style.StyleType) *PixelNebula {
-	styleIndex, err := pn.styleManager.GetStyleIndex(style)
+	styleIndex, err := pn.StyleManager.GetStyleIndex(style)
 	if err != nil {
 		panic(err)
 	}
-	pn.options.StyleIndex = styleIndex
+	pn.Options.StyleIndex = styleIndex
 	return pn
 }
 
 // WithSize 设置尺寸
 func (pn *PixelNebula) WithSize(width, height int) *PixelNebula {
-	pn.width = width
-	pn.height = height
+	pn.Width = width
+	pn.Height = height
 	return pn
 }
 
 // WithCustomizeTheme 设置自定义主题
 func (pn *PixelNebula) WithCustomizeTheme(theme []theme.Theme) *PixelNebula {
-	pn.themeManager.CustomizeTheme(theme)
+	pn.ThemeManager.CustomizeTheme(theme)
 	return pn
 }
 
 // WithCustomizeStyle 设置自定义风格
 func (pn *PixelNebula) WithCustomizeStyle(style []style.StyleSet) *PixelNebula {
-	pn.styleManager.CustomizeStyle(style)
+	pn.StyleManager.CustomizeStyle(style)
 	return pn
 }
 
@@ -186,20 +208,25 @@ func (pn *PixelNebula) calcKey(hash []string, opts *PNOptions) [2]int {
 		return [2]int{opts.StyleIndex, opts.ThemeIndex}
 	}
 
-	// 尝试从缓存中获取结果
+	// 计算缓存键
 	cacheKey := strings.Join(hash, "")
-	keyCacheMux.RLock()
-	if result, ok := keyCache[cacheKey]; ok {
-		keyCacheMux.RUnlock()
+
+	// 计算分片索引
+	shardIndex := getShardIndex(cacheKey)
+
+	// 尝试从缓存中获取结果，使用读锁
+	keyCacheLocks[shardIndex].RLock()
+	if result, ok := keyCacheShardData[shardIndex][cacheKey]; ok {
+		keyCacheLocks[shardIndex].RUnlock()
 		return result
 	}
-	keyCacheMux.RUnlock()
+	keyCacheLocks[shardIndex].RUnlock()
 
 	// 计算哈希值
 	hashNum := pn.hashToNum(hash)
 
 	// 获取可用的风格数量
-	styleCount := pn.themeManager.StyleCount()
+	styleCount := pn.ThemeManager.StyleCount()
 	if styleCount == 0 {
 		return [2]int{0, 0}
 	}
@@ -211,7 +238,7 @@ func (pn *PixelNebula) calcKey(hash []string, opts *PNOptions) [2]int {
 	}
 
 	// 获取该风格下的主题数量
-	themeCount := pn.themeManager.ThemeCount(styleIndex)
+	themeCount := pn.ThemeManager.ThemeCount(styleIndex)
 	if themeCount == 0 {
 		return [2]int{styleIndex, 0}
 	}
@@ -222,58 +249,58 @@ func (pn *PixelNebula) calcKey(hash []string, opts *PNOptions) [2]int {
 		themeIndex = -themeIndex
 	}
 
-	// 将结果存入缓存
+	// 将结果存入缓存，使用写锁
 	result := [2]int{styleIndex, themeIndex}
-	keyCacheMux.Lock()
-	keyCache[cacheKey] = result
-	keyCacheMux.Unlock()
+	keyCacheLocks[shardIndex].Lock()
+	keyCacheShardData[shardIndex][cacheKey] = result
+	keyCacheLocks[shardIndex].Unlock()
 
 	return result
 }
 
 // WithCache 设置缓存选项
 func (pn *PixelNebula) WithCache(options cache.CacheOptions) *PixelNebula {
-	pn.cache = cache.NewCache(options)
+	pn.Cache = cache.NewCache(options)
 	// 确保启动监控器
-	if pn.cache != nil && options.Monitoring.Enabled && pn.cache.GetMonitor() == nil {
-		pn.cache.Monitor = cache.NewMonitor(pn.cache, options.Monitoring)
-		pn.cache.Monitor.Start()
+	if pn.Cache != nil && options.Monitoring.Enabled && pn.Cache.GetMonitor() == nil {
+		pn.Cache.Monitor = cache.NewMonitor(pn.Cache, options.Monitoring)
+		pn.Cache.Monitor.Start()
 	}
 	return pn
 }
 
 // WithDefaultCache 设置默认缓存选项
 func (pn *PixelNebula) WithDefaultCache() *PixelNebula {
-	pn.cache = cache.NewDefaultCache()
+	pn.Cache = cache.NewDefaultCache()
 	// 确保启动监控器
-	if pn.cache != nil && pn.cache.GetOptions().Monitoring.Enabled && pn.cache.GetMonitor() == nil {
-		pn.cache.Monitor = cache.NewMonitor(pn.cache, pn.cache.GetOptions().Monitoring)
-		pn.cache.Monitor.Start()
+	if pn.Cache != nil && pn.Cache.GetOptions().Monitoring.Enabled && pn.Cache.GetMonitor() == nil {
+		pn.Cache.Monitor = cache.NewMonitor(pn.Cache, pn.Cache.GetOptions().Monitoring)
+		pn.Cache.Monitor.Start()
 	}
 	return pn
 }
 
 // WithCompression 设置压缩选项
 func (pn *PixelNebula) WithCompression(options cache.CompressOptions) *PixelNebula {
-	if pn.cache != nil {
-		cacheOptions := pn.cache.GetOptions()
+	if pn.Cache != nil {
+		cacheOptions := pn.Cache.GetOptions()
 		cacheOptions.Compression = options
-		pn.cache.UpdateOptions(cacheOptions)
+		pn.Cache.UpdateOptions(cacheOptions)
 	}
 	return pn
 }
 
 // WithMonitoring 设置监控选项
 func (pn *PixelNebula) WithMonitoring(options cache.MonitorOptions) *PixelNebula {
-	if pn.cache != nil {
-		cacheOptions := pn.cache.GetOptions()
+	if pn.Cache != nil {
+		cacheOptions := pn.Cache.GetOptions()
 		cacheOptions.Monitoring = options
-		pn.cache.UpdateOptions(cacheOptions)
+		pn.Cache.UpdateOptions(cacheOptions)
 
 		// 如果启用了监控但监控器尚未创建，则创建并启动监控器
-		if options.Enabled && pn.cache.Monitor == nil {
-			pn.cache.Monitor = cache.NewMonitor(pn.cache, options)
-			pn.cache.Monitor.Start()
+		if options.Enabled && pn.Cache.Monitor == nil {
+			pn.Cache.Monitor = cache.NewMonitor(pn.Cache, options)
+			pn.Cache.Monitor.Start()
 		}
 	}
 	return pn
@@ -281,42 +308,42 @@ func (pn *PixelNebula) WithMonitoring(options cache.MonitorOptions) *PixelNebula
 
 // WithAnimation 添加动画效果
 func (pn *PixelNebula) WithAnimation(animation animation.Animation) *PixelNebula {
-	pn.animManager.AddAnimation(animation)
+	pn.AnimManager.AddAnimation(animation)
 	return pn
 }
 
 // WithRotateAnimation 添加旋转动画
 func (pn *PixelNebula) WithRotateAnimation(targetID string, fromAngle, toAngle float64, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewRotateAnimation(targetID, fromAngle, toAngle, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithGradientAnimation 添加渐变动画
 func (pn *PixelNebula) WithGradientAnimation(targetID string, colors []string, duration float64, repeatCount int, animate bool) *PixelNebula {
 	anim := animation.NewGradientAnimation(targetID, colors, duration, repeatCount, animate)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithTransformAnimation 添加变换动画
 func (pn *PixelNebula) WithTransformAnimation(targetID string, transformType string, from, to string, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewTransformAnimation(targetID, transformType, from, to, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithFadeAnimation 添加淡入淡出动画
 func (pn *PixelNebula) WithFadeAnimation(targetID string, from, to string, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewFadeAnimation(targetID, from, to, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithPathAnimation 添加路径动画
 func (pn *PixelNebula) WithPathAnimation(targetID string, path string, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewPathAnimation(targetID, path, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
@@ -324,35 +351,50 @@ func (pn *PixelNebula) WithPathAnimation(targetID string, path string, duration 
 func (pn *PixelNebula) WithPathAnimationRotate(targetID string, path string, rotate string, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewPathAnimation(targetID, path, duration, repeatCount)
 	anim.WithRotate(rotate)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithColorAnimation 添加颜色变换动画
 func (pn *PixelNebula) WithColorAnimation(targetID string, property string, fromColor, toColor string, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewColorAnimation(targetID, property, fromColor, toColor, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithBounceAnimation 添加弹跳动画
 func (pn *PixelNebula) WithBounceAnimation(targetID string, property string, from, to string, bounceCount int, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewBounceAnimation(targetID, property, from, to, bounceCount, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithWaveAnimation 添加波浪动画
 func (pn *PixelNebula) WithWaveAnimation(targetID string, amplitude, frequency float64, direction string, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewWaveAnimation(targetID, amplitude, frequency, direction, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
 	return pn
 }
 
 // WithBlinkAnimation 添加闪烁动画
 func (pn *PixelNebula) WithBlinkAnimation(targetID string, minOpacity, maxOpacity float64, blinkCount int, duration float64, repeatCount int) *PixelNebula {
 	anim := animation.NewBlinkAnimation(targetID, minOpacity, maxOpacity, blinkCount, duration, repeatCount)
-	pn.animManager.AddAnimation(anim)
+	pn.AnimManager.AddAnimation(anim)
+	return pn
+}
+
+// WithParallelRender 启用并行渲染
+func (pn *PixelNebula) WithParallelRender(enabled bool) *PixelNebula {
+	pn.Options.ParallelRender = enabled
+	return pn
+}
+
+// WithConcurrencyPool 设置并发池大小
+func (pn *PixelNebula) WithConcurrencyPool(size int) *PixelNebula {
+	if size <= 0 {
+		size = runtime.NumCPU()
+	}
+	pn.Options.ConcurrencyPool = size
 	return pn
 }
 
@@ -375,10 +417,10 @@ func (pn *PixelNebula) Generate(id string, sansEnv bool) *SVGBuilder {
 		pn:         pn,
 		id:         id,
 		sansEnv:    sansEnv,
-		width:      pn.width,
-		height:     pn.height,
-		themeIndex: pn.options.ThemeIndex,
-		styleIndex: pn.options.StyleIndex,
+		width:      pn.Width,
+		height:     pn.Height,
+		themeIndex: pn.Options.ThemeIndex,
+		styleIndex: pn.Options.StyleIndex,
 	}
 }
 
@@ -387,7 +429,7 @@ func (sb *SVGBuilder) SetTheme(theme int) *SVGBuilder {
 	if sb.hasError != nil {
 		return sb
 	}
-	themeCount := sb.pn.themeManager.ThemeCount(sb.styleIndex)
+	themeCount := sb.pn.ThemeManager.ThemeCount(sb.styleIndex)
 	if theme < 0 || theme >= themeCount {
 		log.Printf("pixelnebula: theme index range is:[0, %d), but got %d", themeCount, theme)
 		sb.hasError = errors.ErrInvalidTheme
@@ -403,7 +445,7 @@ func (sb *SVGBuilder) SetStyle(style style.StyleType) *SVGBuilder {
 	if sb.hasError != nil {
 		return sb
 	}
-	index, err := sb.pn.styleManager.GetStyleIndex(style)
+	index, err := sb.pn.StyleManager.GetStyleIndex(style)
 	if err != nil {
 		sb.hasError = err
 		return sb
@@ -418,7 +460,7 @@ func (sb *SVGBuilder) SetStyleByIndex(index int) *SVGBuilder {
 	if sb.hasError != nil {
 		return sb
 	}
-	themeCount := sb.pn.themeManager.StyleCount()
+	themeCount := sb.pn.ThemeManager.StyleCount()
 	if index < 0 || index >= themeCount {
 		log.Printf("pixelnebula: style index range is:[0, %d), but got %d", themeCount, index)
 		sb.hasError = errors.ErrInvalidStyleName
@@ -443,7 +485,7 @@ func (sb *SVGBuilder) SetAnimation(anim animation.Animation) *SVGBuilder {
 	if sb.hasError != nil {
 		return sb
 	}
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -453,7 +495,7 @@ func (sb *SVGBuilder) SetRotateAnimation(targetID string, fromAngle, toAngle flo
 		return sb
 	}
 	anim := animation.NewRotateAnimation(targetID, fromAngle, toAngle, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -463,7 +505,7 @@ func (sb *SVGBuilder) SetGradientAnimation(targetID string, colors []string, dur
 		return sb
 	}
 	anim := animation.NewGradientAnimation(targetID, colors, duration, repeatCount, animate)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -473,7 +515,7 @@ func (sb *SVGBuilder) SetTransformAnimation(targetID string, transformType strin
 		return sb
 	}
 	anim := animation.NewTransformAnimation(targetID, transformType, from, to, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -483,7 +525,7 @@ func (sb *SVGBuilder) SetFadeAnimation(targetID string, from, to string, duratio
 		return sb
 	}
 	anim := animation.NewFadeAnimation(targetID, from, to, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -493,7 +535,7 @@ func (sb *SVGBuilder) SetPathAnimation(targetID string, path string, duration fl
 		return sb
 	}
 	anim := animation.NewPathAnimation(targetID, path, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -504,7 +546,7 @@ func (sb *SVGBuilder) SetPathAnimationRotate(targetID string, path string, rotat
 	}
 	anim := animation.NewPathAnimation(targetID, path, duration, repeatCount)
 	anim.WithRotate(rotate)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -514,7 +556,7 @@ func (sb *SVGBuilder) SetColorAnimation(targetID string, property string, fromCo
 		return sb
 	}
 	anim := animation.NewColorAnimation(targetID, property, fromColor, toColor, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -524,7 +566,7 @@ func (sb *SVGBuilder) SetBounceAnimation(targetID string, property string, from,
 		return sb
 	}
 	anim := animation.NewBounceAnimation(targetID, property, from, to, bounceCount, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -534,7 +576,7 @@ func (sb *SVGBuilder) SetWaveAnimation(targetID string, amplitude, frequency flo
 		return sb
 	}
 	anim := animation.NewWaveAnimation(targetID, amplitude, frequency, direction, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
 	return sb
 }
 
@@ -544,7 +586,28 @@ func (sb *SVGBuilder) SetBlinkAnimation(targetID string, minOpacity, maxOpacity 
 		return sb
 	}
 	anim := animation.NewBlinkAnimation(targetID, minOpacity, maxOpacity, blinkCount, duration, repeatCount)
-	sb.pn.animManager.AddAnimation(anim)
+	sb.pn.AnimManager.AddAnimation(anim)
+	return sb
+}
+
+// SetParallelRender 设置是否启用并行渲染
+func (sb *SVGBuilder) SetParallelRender(enabled bool) *SVGBuilder {
+	if sb.hasError != nil {
+		return sb
+	}
+	sb.pn.Options.ParallelRender = enabled
+	return sb
+}
+
+// SetConcurrencyPool 设置并发池大小
+func (sb *SVGBuilder) SetConcurrencyPool(size int) *SVGBuilder {
+	if sb.hasError != nil {
+		return sb
+	}
+	if size <= 0 {
+		size = runtime.NumCPU()
+	}
+	sb.pn.Options.ConcurrencyPool = size
 	return sb
 }
 
@@ -566,9 +629,9 @@ func (sb *SVGBuilder) Build() *SVGBuilder {
 	}
 
 	sb.svg = svg
-	sb.pn.imgData = []byte(svg)
-	sb.pn.width = sb.width
-	sb.pn.height = sb.height
+	sb.pn.ImgData = []byte(svg)
+	sb.pn.Width = sb.width
+	sb.pn.Height = sb.height
 	return sb
 }
 
@@ -609,7 +672,7 @@ func (sb *SVGBuilder) ToFile(filePath string) error {
 // 将原来的 GenerateSVG 重命名为 generateSVG，作为内部方法
 func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (svg string, err error) {
 	if opts == nil {
-		opts = pn.options
+		opts = pn.Options
 	}
 	// 验证参数
 	if id == "" {
@@ -617,7 +680,7 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 	}
 
 	// 如果启用了缓存，先尝试从缓存获取
-	if pn.cache != nil {
+	if pn.Cache != nil {
 		cacheKey := cache.CacheKey{
 			Id:      id,
 			SansEnv: sansEnv,
@@ -628,7 +691,7 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 			cacheKey.Part = opts.StyleIndex
 		}
 
-		if cachedSVG, found := pn.cache.Get(cacheKey); found {
+		if cachedSVG, found := pn.Cache.Get(cacheKey); found {
 			return cachedSVG, nil
 		}
 	}
@@ -638,9 +701,9 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 	defer hashBufPool.Put(hashBuf)
 
 	// 计算avatarId的哈希值 - 优化版本
-	pn.hasher.Reset()
-	pn.hasher.Write([]byte(id))
-	sum := pn.hasher.Sum((*hashBuf)[:0])
+	pn.Hasher.Reset()
+	pn.Hasher.Write([]byte(id))
+	sum := pn.Hasher.Sum((*hashBuf)[:0])
 	s := hex.EncodeToString(sum)
 	hashStr := numberRegex.FindAllString(s, -1)
 	if len(hashStr) < hashLength {
@@ -676,60 +739,103 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 		mapPool.Put(final)
 	}()
 
-	// 获取并处理各部分的SVG
-	for k, v := range p {
-		// 获取主题颜色
-		themePart, err := pn.themeManager.GetTheme(v[0], v[1])
-		if err != nil {
-			return "", err
-		}
+	// 根据是否启用并行渲染选择处理方式
+	if opts.ParallelRender {
+		// 并行处理
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(p))
+		// 创建互斥锁来保护 final map
+		var finalMux sync.Mutex
 
-		colors, ok := themePart[k]
-		if !ok {
-			return "", errors.ErrInvalidColor
-		}
+		// 对每个部分启动一个 goroutine
+		for k, v := range p {
+			wg.Add(1)
+			go func(key string, val [2]int) {
+				defer wg.Done()
 
-		// 获取形状SVG
-		shapeType := style.ShapeType(k)
-		svgPart, err := pn.styleManager.GetShape(v[0], shapeType)
-		if err != nil {
-			return "", err
-		}
+				// 使用临时变量处理这个部分
+				tempResult := ""
 
-		match := colorRegex.FindAllStringSubmatch(svgPart, -1)
-
-		// 从对象池获取Builder
-		sb := builderPool.Get().(*strings.Builder)
-		sb.Reset()
-		sb.Grow(len(svgPart) + 50) // 预分配足够的容量
-
-		lastIndex := 0
-		for i, m := range match {
-			if i < len(colors) {
-				// 找到完整匹配的位置
-				index := strings.Index(svgPart[lastIndex:], m[0]) + lastIndex
-				// 添加匹配前的部分
-				sb.WriteString(svgPart[lastIndex:index])
-				// 添加替换后的颜色
-				// 检查颜色值是否已经包含#前缀
-				if strings.HasPrefix(colors[i], "#") {
-					sb.WriteString(colors[i])
-				} else {
-					sb.WriteString("#")
-					sb.WriteString(colors[i])
+				// 获取主题颜色
+				themePart, err := pn.ThemeManager.GetTheme(val[0], val[1])
+				if err != nil {
+					errChan <- err
+					return
 				}
-				sb.WriteString(";")
-				// 更新lastIndex
-				lastIndex = index + len(m[0])
+
+				colors, ok := themePart[key]
+				if !ok {
+					errChan <- errors.ErrInvalidColor
+					return
+				}
+
+				// 获取形状SVG
+				shapeType := style.ShapeType(key)
+				svgPart, err := pn.StyleManager.GetShape(val[0], shapeType)
+				if err != nil {
+					errChan <- err
+					return
+				}
+
+				match := colorRegex.FindAllStringSubmatch(svgPart, -1)
+
+				// 从对象池获取Builder
+				sb := builderPool.Get().(*strings.Builder)
+				sb.Reset()
+				sb.Grow(len(svgPart) + 50) // 预分配足够的容量
+
+				lastIndex := 0
+				for i, m := range match {
+					if i < len(colors) {
+						// 找到完整匹配的位置
+						index := strings.Index(svgPart[lastIndex:], m[0]) + lastIndex
+						// 添加匹配前的部分
+						sb.WriteString(svgPart[lastIndex:index])
+						// 添加替换后的颜色
+						// 检查颜色值是否已经包含#前缀
+						if strings.HasPrefix(colors[i], "#") {
+							sb.WriteString(colors[i])
+						} else {
+							sb.WriteString("#")
+							sb.WriteString(colors[i])
+						}
+						sb.WriteString(";")
+						// 更新lastIndex
+						lastIndex = index + len(m[0])
+					}
+				}
+				// 添加剩余部分
+				sb.WriteString(svgPart[lastIndex:])
+
+				tempResult = sb.String()
+
+				// 归还Builder到对象池
+				builderPool.Put(sb)
+
+				// 使用互斥锁保护对 final map 的写入
+				finalMux.Lock()
+				final[key] = tempResult
+				finalMux.Unlock()
+			}(k, v)
+		}
+
+		// 等待所有部分处理完成
+		wg.Wait()
+
+		// 检查是否有错误
+		select {
+		case err := <-errChan:
+			return "", err
+		default:
+			// 没有错误，继续处理
+		}
+	} else {
+		// 串行处理
+		for k, v := range p {
+			if err := pn.processSVGPart(k, v, final); err != nil {
+				return "", err
 			}
 		}
-		// 添加剩余部分
-		sb.WriteString(svgPart[lastIndex:])
-
-		final[k] = sb.String()
-
-		// 归还Builder到对象池
-		builderPool.Put(sb)
 	}
 
 	// 使用对象池获取主Builder来构建最终SVG
@@ -742,7 +848,7 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 	builder.WriteString(pn.getSvgStart())
 
 	// 获取动画定义
-	animations := pn.animManager.GenerateSVGAnimations()
+	animations := pn.AnimManager.GenerateSVGAnimations()
 	if animations != "" {
 		builder.WriteString(animations)
 	}
@@ -752,7 +858,7 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 	rotateAnimationSVGs := make(map[string]string)
 
 	// 收集旋转动画
-	for _, anim := range pn.animManager.GetAnimations() {
+	for _, anim := range pn.AnimManager.GetAnimations() {
 		if rotateAnim, ok := anim.(*animation.RotateAnimation); ok {
 			targetID := anim.GetTargetID()
 			rotateAnimations[targetID] = true
@@ -796,17 +902,17 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 		}
 	}
 
-	builder.WriteString(pn.svgEnd)
+	builder.WriteString(pn.SvgEnd)
 	svg = builder.String()
 
 	// 将生成的SVG存储到实例中
-	pn.imgData = []byte(svg)
+	pn.ImgData = []byte(svg)
 
 	// 归还Builder到对象池
 	builderPool.Put(builder)
 
 	// 如果启用了缓存，将结果存入缓存
-	if pn.cache != nil {
+	if pn.Cache != nil {
 		cacheKey := cache.CacheKey{
 			Id:      id,
 			SansEnv: sansEnv,
@@ -817,7 +923,7 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 			cacheKey.Part = opts.StyleIndex
 		}
 
-		pn.cache.Set(cacheKey, svg)
+		pn.Cache.Set(cacheKey, svg)
 	}
 
 	return svg, nil
@@ -825,15 +931,15 @@ func (pn *PixelNebula) generateSVG(id string, sansEnv bool, opts *PNOptions) (sv
 
 // GetCacheStats 获取缓存统计信息
 func (pn *PixelNebula) GetCacheStats() (size, hits, misses int, hitRate float64, enabled bool, maxSize int, expiration time.Duration, evictionType string) {
-	if pn.cache == nil {
+	if pn.Cache == nil {
 		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
 		return 0, 0, 0, 0, false, 0, 0, ""
 	}
 
-	hits, misses, hitRate = pn.cache.Stats()
-	options := pn.cache.GetOptions()
+	hits, misses, hitRate = pn.Cache.Stats()
+	options := pn.Cache.GetOptions()
 
-	return pn.cache.Size(), hits, misses, hitRate, options.Enabled, options.Size, options.Expiration, options.EvictionType
+	return pn.Cache.Size(), hits, misses, hitRate, options.Enabled, options.Size, options.Expiration, options.EvictionType
 }
 
 // CacheItemInfo 缓存项信息结构体
@@ -848,15 +954,15 @@ type CacheItemInfo struct {
 
 // GetCacheItems 获取所有缓存项
 func (pn *PixelNebula) GetCacheItems() []CacheItemInfo {
-	result := []CacheItemInfo{}
+	var result []CacheItemInfo
 
-	if pn.cache == nil {
+	if pn.Cache == nil {
 		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
 		return result
 	}
 
 	// 获取内部缓存项
-	items := pn.cache.GetAllItems()
+	items := pn.Cache.GetAllItems()
 	if len(items) == 0 {
 		log.Println("pixelnebula: 缓存中没有数据，请先生成一些SVG")
 	}
@@ -891,12 +997,12 @@ type MonitorSampleInfo struct {
 func (pn *PixelNebula) GetMonitorStats() (enabled bool, sampleInterval, adjustInterval time.Duration,
 	targetHitRate float64, lastAdjusted time.Time, samples []MonitorSampleInfo) {
 
-	if pn.cache == nil {
+	if pn.Cache == nil {
 		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
 		return false, 0, 0, 0, time.Time{}, nil
 	}
 
-	options := pn.cache.GetOptions().Monitoring
+	options := pn.Cache.GetOptions().Monitoring
 
 	// 确保监控器已启用并初始化
 	if !options.Enabled {
@@ -904,13 +1010,13 @@ func (pn *PixelNebula) GetMonitorStats() (enabled bool, sampleInterval, adjustIn
 		return options.Enabled, options.SampleInterval, options.AdjustInterval, options.TargetHitRate, time.Time{}, nil
 	}
 
-	if pn.cache.GetMonitor() == nil {
+	if pn.Cache.GetMonitor() == nil {
 		log.Println("pixelnebula: 监控器未初始化，正在初始化...")
-		pn.cache.Monitor = cache.NewMonitor(pn.cache, options)
-		pn.cache.Monitor.Start()
+		pn.Cache.Monitor = cache.NewMonitor(pn.Cache, options)
+		pn.Cache.Monitor.Start()
 	}
 
-	monitor := pn.cache.GetMonitor()
+	monitor := pn.Cache.GetMonitor()
 	stats := monitor.GetStats()
 	sampleHistory := monitor.GetSampleHistory()
 
@@ -938,7 +1044,7 @@ func (pn *PixelNebula) GetMonitorStats() (enabled bool, sampleInterval, adjustIn
 
 // DeleteCacheItem 删除指定的缓存项
 func (pn *PixelNebula) DeleteCacheItem(key string) bool {
-	if pn.cache == nil {
+	if pn.Cache == nil {
 		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
 		return false
 	}
@@ -973,7 +1079,7 @@ func (pn *PixelNebula) DeleteCacheItem(key string) bool {
 		Part:    part,
 	}
 
-	result := pn.cache.DeleteItem(cacheKey)
+	result := pn.Cache.DeleteItem(cacheKey)
 	if !result {
 		log.Printf("pixelnebula: 未找到缓存项: %s", key)
 	}
@@ -982,11 +1088,382 @@ func (pn *PixelNebula) DeleteCacheItem(key string) bool {
 
 // ClearCache 清空缓存
 func (pn *PixelNebula) ClearCache() {
-	if pn.cache == nil {
+	if pn.Cache == nil {
 		log.Println("pixelnebula: 缓存未初始化，请先调用WithCache或WithDefaultCache")
 		return
 	}
 
-	pn.cache.Clear()
+	pn.Cache.Clear()
 	log.Println("pixelnebula: 缓存已清空")
+}
+
+// 将原来的 generateSVG 方法中的部分代码提取为独立函数，方便并行处理
+func (pn *PixelNebula) processSVGPart(k string, v [2]int, final map[string]string) error {
+	// 获取主题颜色
+	themePart, err := pn.ThemeManager.GetTheme(v[0], v[1])
+	if err != nil {
+		return err
+	}
+
+	colors, ok := themePart[k]
+	if !ok {
+		return errors.ErrInvalidColor
+	}
+
+	// 获取形状SVG
+	shapeType := style.ShapeType(k)
+	svgPart, err := pn.StyleManager.GetShape(v[0], shapeType)
+	if err != nil {
+		return err
+	}
+
+	match := colorRegex.FindAllStringSubmatch(svgPart, -1)
+
+	// 从对象池获取Builder
+	sb := builderPool.Get().(*strings.Builder)
+	sb.Reset()
+	sb.Grow(len(svgPart) + 50) // 预分配足够的容量
+
+	lastIndex := 0
+	for i, m := range match {
+		if i < len(colors) {
+			// 找到完整匹配的位置
+			index := strings.Index(svgPart[lastIndex:], m[0]) + lastIndex
+			// 添加匹配前的部分
+			sb.WriteString(svgPart[lastIndex:index])
+			// 添加替换后的颜色
+			// 检查颜色值是否已经包含#前缀
+			if strings.HasPrefix(colors[i], "#") {
+				sb.WriteString(colors[i])
+			} else {
+				sb.WriteString("#")
+				sb.WriteString(colors[i])
+			}
+			sb.WriteString(";")
+			// 更新lastIndex
+			lastIndex = index + len(m[0])
+		}
+	}
+	// 添加剩余部分
+	sb.WriteString(svgPart[lastIndex:])
+
+	final[k] = sb.String()
+
+	// 归还Builder到对象池
+	builderPool.Put(sb)
+
+	return nil
+}
+
+// GenerateBatch 批量生成SVG图像
+// ids：要生成的ID列表
+// sansEnv：是否不包含环境
+// opts：生成选项
+// 返回：SVG映射表（id -> svg）和错误
+func (pn *PixelNebula) GenerateBatch(ids []string, sansEnv bool, opts *PNOptions) (map[string]string, error) {
+	if opts == nil {
+		opts = pn.Options
+	}
+
+	// 验证参数
+	if len(ids) == 0 {
+		return nil, errors.ErrAvatarIDRequired
+	}
+
+	// 创建结果映射
+	result := make(map[string]string, len(ids))
+
+	// 如果没有启用并发处理，则串行生成
+	if !opts.ParallelRender {
+		for _, id := range ids {
+			svg, err := pn.generateSVG(id, sansEnv, opts)
+			if err != nil {
+				return result, err
+			}
+			result[id] = svg
+		}
+		return result, nil
+	}
+
+	// 并发生成
+	// 创建一个工作池限制并发数
+	workerCount := opts.ConcurrencyPool
+	if workerCount <= 0 {
+		workerCount = runtime.NumCPU()
+	}
+
+	// 创建任务通道
+	tasks := make(chan string, len(ids))
+	for _, id := range ids {
+		tasks <- id
+	}
+	close(tasks)
+
+	// 创建结果通道
+	type resultPair struct {
+		id  string
+		svg string
+		err error
+	}
+	resultChan := make(chan resultPair, len(ids))
+
+	// 启动工作池
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// 创建一个新的PixelNebula实例，但只复制必要的字段，避免资源竞争
+			// 特别是创建独立的哈希实例
+			workerPN := &PixelNebula{
+				SvgEnd:       pn.SvgEnd,
+				ThemeManager: pn.ThemeManager, // 这些管理器是安全的，因为它们的方法是并发安全的或只读的
+				StyleManager: pn.StyleManager,
+				AnimManager:  pn.AnimManager,
+				Cache:        pn.Cache,     // 缓存有自己的锁机制
+				Hasher:       sha256.New(), // 创建新的哈希实例，避免并发访问冲突
+				Options:      opts,
+				Width:        pn.Width,
+				Height:       pn.Height,
+			}
+
+			for id := range tasks {
+				svg, err := workerPN.generateSVG(id, sansEnv, opts)
+				resultChan <- resultPair{id, svg, err}
+			}
+		}()
+	}
+
+	// 等待所有工作完成
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// 收集结果
+	for r := range resultChan {
+		if r.err != nil {
+			return result, r.err
+		}
+		result[r.id] = r.svg
+	}
+
+	return result, nil
+}
+
+// SaveBatchToFiles 批量保存SVG到文件
+// ids：要生成的ID列表
+// sansEnv：是否不包含环境
+// opts：生成选项
+// filePathPattern：文件路径模式，如 "output/avatar_%s.svg"，其中 %s 将被替换为ID
+// 返回：成功保存的文件数量和错误
+func (pn *PixelNebula) SaveBatchToFiles(ids []string, sansEnv bool, opts *PNOptions, filePathPattern string) (int, error) {
+	if opts == nil {
+		opts = pn.Options
+	}
+
+	// 验证参数
+	if len(ids) == 0 {
+		return 0, errors.ErrAvatarIDRequired
+	}
+
+	if filePathPattern == "" {
+		return 0, fmt.Errorf("文件路径模式不能为空")
+	}
+
+	// 批量生成SVG
+	svgs, err := pn.GenerateBatch(ids, sansEnv, opts)
+	if err != nil {
+		return 0, err
+	}
+
+	// 保存文件的处理函数
+	saveFile := func(id, svg, pathPattern string) error {
+		filePath := fmt.Sprintf(pathPattern, id)
+
+		// 确保目录存在
+		dir := filepath.Dir(filePath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+
+		return os.WriteFile(filePath, []byte(svg), 0644)
+	}
+
+	// 如果不启用并行处理，串行保存
+	if !opts.ParallelRender {
+		count := 0
+		for id, svg := range svgs {
+			if err := saveFile(id, svg, filePathPattern); err != nil {
+				return count, err
+			}
+			count++
+		}
+		return count, nil
+	}
+
+	// 并行保存文件
+	workerCount := opts.ConcurrencyPool
+	if workerCount <= 0 {
+		workerCount = runtime.NumCPU()
+	}
+
+	// 创建任务通道
+	type saveTask struct {
+		id  string
+		svg string
+	}
+	tasks := make(chan saveTask, len(svgs))
+	for id, svg := range svgs {
+		tasks <- saveTask{id, svg}
+	}
+	close(tasks)
+
+	// 创建结果通道和错误通道
+	type saveResult struct {
+		success bool
+		err     error
+	}
+	resultChan := make(chan saveResult, len(svgs))
+
+	// 启动工作池
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				err := saveFile(task.id, task.svg, filePathPattern)
+				resultChan <- saveResult{err == nil, err}
+			}
+		}()
+	}
+
+	// 等待所有工作完成
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// 收集结果
+	successCount := 0
+	var firstError error
+
+	for result := range resultChan {
+		if result.success {
+			successCount++
+		} else if firstError == nil {
+			// 保存第一个遇到的错误
+			firstError = result.err
+		}
+	}
+
+	return successCount, firstError
+}
+
+// BatchToBase64 批量转换SVG到Base64
+// svgs: SVG字符串映射，key为ID，value为SVG内容
+// width, height: SVG尺寸
+// 返回: Base64编码的映射表（id -> base64）和错误
+func (pn *PixelNebula) BatchToBase64(svgs map[string]string, width, height int) (map[string]string, error) {
+	if len(svgs) == 0 {
+		return nil, fmt.Errorf("没有需要转换的SVG")
+	}
+
+	// 创建结果映射
+	result := make(map[string]string, len(svgs))
+
+	// 如果没有启用并发处理，则串行转换
+	if !pn.Options.ParallelRender {
+		for id, svg := range svgs {
+			conv := converter.NewSVGConverter([]byte(svg), width, height)
+			base64Str, err := conv.ToBase64()
+			if err != nil {
+				return result, err
+			}
+			result[id] = base64Str
+		}
+		return result, nil
+	}
+
+	// 并发转换
+	// 创建一个工作池限制并发数
+	workerCount := pn.Options.ConcurrencyPool
+	if workerCount <= 0 {
+		workerCount = runtime.NumCPU()
+	}
+
+	// 创建任务通道
+	type convTask struct {
+		id  string
+		svg string
+	}
+	tasks := make(chan convTask, len(svgs))
+	for id, svg := range svgs {
+		tasks <- convTask{id, svg}
+	}
+	close(tasks)
+
+	// 创建结果通道
+	type resultPair struct {
+		id     string
+		base64 string
+		err    error
+	}
+	resultChan := make(chan resultPair, len(svgs))
+
+	// 启动工作池
+	var wg sync.WaitGroup
+	var resultMutex sync.Mutex // 添加互斥锁保护结果映射
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				// 每个任务创建一个新的转换器实例
+				conv := converter.NewSVGConverter([]byte(task.svg), width, height)
+				base64Str, err := conv.ToBase64()
+
+				// 使用通道传递结果，避免直接操作共享map
+				resultChan <- resultPair{task.id, base64Str, err}
+			}
+		}()
+	}
+
+	// 等待所有工作完成
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// 收集结果
+	for r := range resultChan {
+		if r.err != nil {
+			return result, r.err
+		}
+		// 使用互斥锁保护map写入
+		resultMutex.Lock()
+		result[r.id] = r.base64
+		resultMutex.Unlock()
+	}
+
+	return result, nil
+}
+
+// GenerateBatchBase64 添加批量生成Base64方法，直接从ID生成
+func (pn *PixelNebula) GenerateBatchBase64(ids []string, sansEnv bool, opts *PNOptions, width, height int) (map[string]string, error) {
+	if opts == nil {
+		opts = pn.Options
+	}
+
+	// 先批量生成SVG
+	svgs, err := pn.GenerateBatch(ids, sansEnv, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// 批量转换为Base64
+	return pn.BatchToBase64(svgs, width, height)
 }
