@@ -172,9 +172,9 @@ func monitoredCacheExample() {
 func compressedCacheExample() {
 	// 创建压缩选项
 	compressOptions := cache.CompressOptions{
-		Enabled:      true,
-		Level:        6,
-		MinSizeBytes: 100, // 最小压缩大小 (字节)
+		Enabled: true,
+		Level:   6,
+		MinSize: 100, // 最小压缩大小 (字节)
 	}
 
 	// 创建一个带默认缓存和压缩的PixelNebula实例

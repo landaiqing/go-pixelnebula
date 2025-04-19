@@ -23,9 +23,9 @@ func TestPixelNebula(t *testing.T) {
 	}
 
 	// 打印可用的风格和主题数量
-	fmt.Printf("总风格数量: %d\n", pn.themeManager.StyleCount())
-	for i := 0; i < pn.themeManager.StyleCount(); i++ {
-		fmt.Printf("风格 %d 的主题数量: %d\n", i, pn.themeManager.ThemeCount(i))
+	fmt.Printf("总风格数量: %d\n", pn.ThemeManager.StyleCount())
+	for i := 0; i < pn.ThemeManager.StyleCount(); i++ {
+		fmt.Printf("风格 %d 的主题数量: %d\n", i, pn.ThemeManager.ThemeCount(i))
 	}
 
 	for i, id := range testIDs {
@@ -46,9 +46,9 @@ func TestPixelNebula(t *testing.T) {
 		}
 
 		// 打印调试信息
-		pn.hasher.Reset()
-		pn.hasher.Write([]byte(id))
-		sum := pn.hasher.Sum(nil)
+		pn.Hasher.Reset()
+		pn.Hasher.Write([]byte(id))
+		sum := pn.Hasher.Sum(nil)
 		hashStr := hex.EncodeToString(sum)
 
 		// 提取数字
@@ -144,7 +144,7 @@ func TestDemo(t *testing.T) {
 	pn := NewPixelNebula()
 
 	// 设置风格和尺寸
-	pn.WithStyle(style.MetaStyle)
+	pn.WithStyle(style.GuyStyle)
 	pn.WithTheme(1)
 	pn.WithSize(231, 231)
 
